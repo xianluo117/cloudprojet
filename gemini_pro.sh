@@ -47,7 +47,8 @@ log() {
     local timestamp
     timestamp=$(date '+%Y-%m-%d %H:%M:%S')
     [[ -d "$TEMP_DIR" ]] || mkdir -p "$TEMP_DIR" 2>/dev/null
-    echo "[$timestamp] [$level] $msg" | tee -a "${TEMP_DIR}/script.log"
+    # 输出到 stderr, 避免日志混入 $(...) 捕获的命令结果
+    echo "[$timestamp] [$level] $msg" | tee -a "${TEMP_DIR}/script.log" >&2
 }
 
 # 心跳机制
@@ -78,7 +79,7 @@ parse_json() {
     local field="$2"
     local value=""
     if command -v jq &>/dev/null; then
-        value=$(echo "$json_input" | jq -r "$field // \"\"")
+        value=$(echo "$json_input" | jq -r "$field // \"\"" 2>/dev/null)
     else
         # sed/grep fallback is complex for nested keys, jq is highly recommended.
         # This simplified version will not work for ".response.keyString"
@@ -130,7 +131,7 @@ retry_with_backoff() {
         if (( exit_code == 0 )); then echo "$output"; return 0; fi
         log "WARN" "命令失败 (尝试 $attempt/$max_attempts): $(echo "$cmd_str" | cut -d' ' -f1-4)..."
         log "WARN" "--> 错误详情: $error_msg"
-        if [[ "$error_msg" == *"Permission denied"* || "$error_msg" == *"INVALID_ARGUMENT"* || "$error_msg" == *"already exists"* ]]; then
+        if [[ "$error_msg" == *"Permission denied"* || "$error_msg" == *"INVALID_ARGUMENT"* || "$error_msg" == *"already exists"* || "$error_msg" == *"Invalid value for"* ]]; then
             log "ERROR" "检测到不可重试错误，停止。"; return $exit_code;
         fi
         if [[ "$error_msg" == *"Quota exceeded"* || "$error_msg" == *"RESOURCE_EXHAUSTED"* ]]; then
@@ -171,7 +172,7 @@ task_enable_api() {
 
 task_create_key() {
     local project_id="$1"; local success_file="$2"; local create_output
-    create_output=$(retry_with_backoff "$MAX_RETRY_ATTEMPTS" "gcloud services api-keys create --project=\"$project_id\" --display-name=\"Gemini-API-Key\" --format=json --quiet")
+    create_output=$(retry_with_backoff "$MAX_RETRY_ATTEMPTS" "gcloud services api-keys create --project=\"$project_id\" --display-name=\"Gemini-API-Key\" --api-target=service=generativelanguage.googleapis.com --format=json --quiet")
     if [[ -z "$create_output" ]]; then log "ERROR" "为项目 $project_id 创建密钥失败 (无输出)。"; return 1; fi
     local gcp_error_msg; gcp_error_msg=$(parse_json "$create_output" ".error.message")
     if [[ -n "$gcp_error_msg" ]]; then log "ERROR" "为项目 $project_id 创建密钥时GCP返回错误: $gcp_error_msg"; log "DEBUG" "GCP错误详情: $create_output"; return 1; fi
