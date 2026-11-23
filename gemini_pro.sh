@@ -303,7 +303,6 @@ extract_keys_from_existing_projects() {
     stop_heartbeat
     if [ ${#projects_to_process[@]} -eq 0 ]; then log "INFO" "所有项目均已有密钥，无需操作。"; return 0; fi
     log "INFO" "将为 ${#projects_to_process[@]} 个没有密钥的项目创建新密钥。"
-    read -p "确认继续吗? [y/N]: " r; [[ "$r" =~ ^[Yy]$ ]] || { log "INFO" "操作已取消。"; return 1; }
     local ENABLED_PROJECTS_FILE="${TEMP_DIR}/existing_enabled.txt"; run_parallel task_enable_api "启用API" "$ENABLED_PROJECTS_FILE" "${projects_to_process[@]}"
     local enabled_project_ids=(); mapfile -t enabled_project_ids < "$ENABLED_PROJECTS_FILE"; if [ ${#enabled_project_ids[@]} -eq 0 ]; then log "ERROR" "API启用阶段失败。"; return 1; fi
     local KEYS_CREATED_FILE="${TEMP_DIR}/existing_keys.txt"; run_parallel task_create_key "创建密钥" "$KEYS_CREATED_FILE" "${enabled_project_ids[@]}"
