@@ -31,7 +31,8 @@ PURE_KEY_FILE="key.txt"
 COMMA_SEPARATED_KEY_FILE="comma_separated_keys_${EMAIL_USERNAME}.txt"
 DELETION_LOG="project_deletion_$(date +%Y%m%d_%H%M%S).log"
 CLEANUP_LOG="api_keys_cleanup_$(date +%Y%m%d_%H%M%S).log"
-TEMP_DIR="/tmp/gcp_script_${TIMESTAMP}"
+TEMP_DIR="$(mktemp -d /tmp/gcp_script_XXXXXXXX 2>/dev/null || echo "/tmp/gcp_script_${TIMESTAMP}_$$")"
+MAIN_PID=$$
 HEARTBEAT_PID=""
 
 # 启动时创建临时目录
@@ -45,6 +46,7 @@ log() {
     local msg="$2"
     local timestamp
     timestamp=$(date '+%Y-%m-%d %H:%M:%S')
+    [[ -d "$TEMP_DIR" ]] || mkdir -p "$TEMP_DIR" 2>/dev/null
     echo "[$timestamp] [$level] $msg" | tee -a "${TEMP_DIR}/script.log"
 }
 
@@ -109,15 +111,22 @@ write_keys_to_files() {
     ) 200>"${TEMP_DIR}/key_files.lock"
 }
 
+# 记录成功项 (带文件锁, 目录缺失时自动重建)
+record_success() {
+    local item="$1"; local success_file="$2"
+    mkdir -p "$(dirname "$success_file")" 2>/dev/null
+    ( flock -w 30 200; echo "$item" >> "$success_file" ) 200>"${success_file}.lock"
+}
+
 # 改进的重试函数
 retry_with_backoff() {
     local max_attempts=$1; shift; local cmd_str="$1"; local attempt=1; local base_timeout=5
     while (( attempt <= max_attempts )); do
         local output; local error_msg;
-        exec 3>&1
-        error_msg=$({ output=$(eval "$cmd_str" 2>&1 >&3); } 2>&1)
-        exec 3>&-
+        local tmp_out; tmp_out=$(mktemp "${TEMP_DIR}/out.XXXXXX" 2>/dev/null || mktemp)
+        error_msg=$(eval "$cmd_str" 2>&1 >"$tmp_out")
         local exit_code=$?
+        output=$(cat "$tmp_out" 2>/dev/null); rm -f "$tmp_out"
         if (( exit_code == 0 )); then echo "$output"; return 0; fi
         log "WARN" "命令失败 (尝试 $attempt/$max_attempts): $(echo "$cmd_str" | cut -d' ' -f1-4)..."
         log "WARN" "--> 错误详情: $error_msg"
@@ -149,14 +158,14 @@ show_progress() {
 task_create_project() {
     local project_id="$1"; local success_file="$2"
     if retry_with_backoff "$MAX_RETRY_ATTEMPTS" "gcloud projects create \"$project_id\" --name=\"$project_id\" --no-set-as-default --quiet"; then
-        (flock 200; echo "$project_id" >> "$success_file";) 200>"${success_file}.lock"; return 0
+        record_success "$project_id" "$success_file"; return 0
     else return 1; fi
 }
 
 task_enable_api() {
     local project_id="$1"; local success_file="$2"
     if retry_with_backoff "$MAX_RETRY_ATTEMPTS" "gcloud services enable generativelanguage.googleapis.com --project=\"$project_id\" --quiet"; then
-        (flock 200; echo "$project_id" >> "$success_file";) 200>"${success_file}.lock"; return 0
+        record_success "$project_id" "$success_file"; return 0
     else return 1; fi
 }
 
@@ -172,7 +181,7 @@ task_create_key() {
     # ===== END OF FIX =====
 
     if [[ -n "$api_key" ]]; then
-        write_keys_to_files "$api_key"; (flock 200; echo "$project_id" >> "$success_file";) 200>"${success_file}.lock"; return 0
+        write_keys_to_files "$api_key"; record_success "$project_id" "$success_file"; return 0
     else
         log "ERROR" "为项目 $project_id 提取密钥失败 (无法解析 .response.keyString)。"; log "DEBUG" "gcloud返回内容: $create_output"; return 1
     fi
@@ -181,21 +190,21 @@ task_create_key() {
 task_delete_project() {
     local project_id="$1"; local success_file="$2"
     if retry_with_backoff 2 "gcloud projects delete \"$project_id\" --quiet"; then
-        (flock 200; echo "$project_id" >> "$success_file";) 200>"${success_file}.lock"; return 0
+        record_success "$project_id" "$success_file"; return 0
     else return 1; fi
 }
 
 task_cleanup_keys() {
     local project_id="$1"; local success_file="$2"; local key_names; readarray -t key_names < <(gcloud services api-keys list --project="$project_id" --format="value(name)" --quiet)
     if [ ${#key_names[@]} -eq 0 ]; then
-        (flock 200; echo "$project_id" >> "$success_file";) 200>"${success_file}.lock"; return 0
+        record_success "$project_id" "$success_file"; return 0
     fi
     local all_success=true
     for key_name in "${key_names[@]}"; do
         if ! retry_with_backoff 2 "gcloud services api-keys delete \"$key_name\" --quiet"; then all_success=false; fi
         sleep 0.5
     done
-    if $all_success; then (flock 200; echo "$project_id" >> "$success_file";) 200>"${success_file}.lock"; return 0; else return 1; fi
+    if $all_success; then record_success "$project_id" "$success_file"; return 0; else return 1; fi
 }
 
 # ===== 并行执行与报告 =====
@@ -205,8 +214,8 @@ run_parallel() {
     if (( total_items == 0 )); then log "INFO" "在 '$description' 阶段无项目处理。"; return; fi
     log "INFO" "开始并行执行 '$description' (最大并发: $MAX_PARALLEL_JOBS)..."
     local pids=(); local completed_count=0
-    export -f log retry_with_backoff parse_json write_keys_to_files "$task_func" show_progress; export MAX_RETRY_ATTEMPTS PURE_KEY_FILE COMMA_SEPARATED_KEY_FILE TEMP_DIR
-    > "$success_file"
+    export -f log retry_with_backoff parse_json write_keys_to_files record_success "$task_func" show_progress; export MAX_RETRY_ATTEMPTS PURE_KEY_FILE COMMA_SEPARATED_KEY_FILE TEMP_DIR
+    mkdir -p "$(dirname "$success_file")"; > "$success_file"
     for i in "${!items[@]}"; do
         if (( ${#pids[@]} >= MAX_PARALLEL_JOBS )); then
             wait -n "${pids[@]}"; for j in "${!pids[@]}"; do if ! kill -0 "${pids[j]}" 2>/dev/null; then unset 'pids[j]'; ((completed_count++)); fi; done
@@ -369,7 +378,12 @@ show_menu() {
     read -p "按回车键返回主菜单..."
 }
 
-cleanup_resources() { log "INFO" "执行退出清理..."; stop_heartbeat; pkill -P $$ &>/dev/null; rm -rf "$TEMP_DIR"; }
+cleanup_resources() {
+    # 只允许主进程执行清理, 防止子进程/后台任务误删临时目录
+    [[ "${BASHPID:-$$}" == "$MAIN_PID" ]] || return 0
+    echo "[$(date '+%Y-%m-%d %H:%M:%S')] [INFO] 执行退出清理..."; stop_heartbeat; pkill -P "$MAIN_PID" &>/dev/null
+    [[ -n "$TEMP_DIR" && "$TEMP_DIR" == /tmp/gcp_script_* ]] && rm -rf "$TEMP_DIR"
+}
 check_prerequisites() {
     log "INFO" "执行前置检查..."; if ! command -v gcloud &> /dev/null; then log "ERROR" "未找到 'gcloud' 命令。"; return 1; fi
     if ! gcloud auth list --filter=status:ACTIVE --format="value(account)" | grep -q "."; then log "WARN" "未检测到活跃GCP账号，请先登录。"; gcloud auth login || return 1; fi
@@ -378,7 +392,9 @@ check_prerequisites() {
 }
 
 # ===== 程序入口 =====
-trap cleanup_resources EXIT SIGINT SIGTERM
+trap cleanup_resources EXIT
+trap 'exit 130' SIGINT
+trap 'exit 143' SIGTERM
 if ! check_prerequisites; then log "ERROR" "前置检查失败，程序退出。"; exit 1; fi
 log "INFO" "密钥管理器 v3.8 (最终修复版) 已启动！"
 sleep 1
