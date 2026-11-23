@@ -26,10 +26,12 @@ GLOBAL_WAIT_SECONDS=75
 MAX_RETRY_ATTEMPTS=3
 QUOTA_MAX_WAITS=6          # 遇到 429 配额限制时最多额外等待的次数 (每次约60秒, 不计入普通重试次数)
 LAUNCH_INTERVAL=1          # 并行任务之间的启动间隔(秒), 降低每分钟请求峰值
+KEY_DISPLAY_MODE="project" # 密钥显示方式: project = 项目|密钥, key = 仅密钥
 SECONDS=0
 
 # 文件和目录配置
 PURE_KEY_FILE="key.txt"
+PROJECT_KEY_FILE="project_keys.txt"   # 每行: 项目ID|密钥
 COMMA_SEPARATED_KEY_FILE="comma_separated_keys_${EMAIL_USERNAME}.txt"
 DELETION_LOG="project_deletion_$(date +%Y%m%d_%H%M%S).log"
 CLEANUP_LOG="api_keys_cleanup_$(date +%Y%m%d_%H%M%S).log"
@@ -98,11 +100,12 @@ parse_json() {
 
 # 文件写入函数 (带文件锁)
 write_keys_to_files() {
-    local api_key="$1"
+    local api_key="$1"; local project_id="${2:-unknown}"
     if [[ -z "$api_key" ]]; then return 1; fi
     (
         if flock -w 10 200; then
             echo "$api_key" >> "$PURE_KEY_FILE"
+            echo "${project_id}|${api_key}" >> "$PROJECT_KEY_FILE"
             if [[ -s "$COMMA_SEPARATED_KEY_FILE" ]]; then
                 echo -n "," >> "$COMMA_SEPARATED_KEY_FILE"
             fi
@@ -191,7 +194,7 @@ task_create_key() {
     # ===== END OF FIX =====
 
     if [[ -n "$api_key" ]]; then
-        write_keys_to_files "$api_key"; record_success "$project_id" "$success_file"; return 0
+        write_keys_to_files "$api_key" "$project_id"; record_success "$project_id" "$success_file"; return 0
     else
         log "ERROR" "为项目 $project_id 提取密钥失败 (无法解析 .response.keyString)。"; log "DEBUG" "gcloud返回内容: $create_output"; return 1
     fi
@@ -204,7 +207,7 @@ task_read_keys() {
     local got=0 key_name key_string
     for key_name in "${key_names[@]}"; do
         key_string=$(retry_with_backoff "$MAX_RETRY_ATTEMPTS" "gcloud services api-keys get-key-string \"$key_name\" --format=\"value(keyString)\" --quiet" | tr -d '[:space:]')
-        if [[ -n "$key_string" ]]; then write_keys_to_files "$key_string"; ((got++)); else log "ERROR" "读取密钥失败: $key_name"; fi
+        if [[ -n "$key_string" ]]; then write_keys_to_files "$key_string" "$project_id"; ((got++)); else log "ERROR" "读取密钥失败: $key_name"; fi
     done
     if (( got > 0 )); then record_success "$project_id" "$success_file"; return 0; else return 1; fi
 }
@@ -235,7 +238,7 @@ run_parallel() {
     if (( total_items == 0 )); then log "INFO" "在 '$description' 阶段无项目处理。"; return; fi
     log "INFO" "开始并行执行 '$description' (最大并发: $MAX_PARALLEL_JOBS)..."
     local pids=(); local completed_count=0
-    export -f log retry_with_backoff parse_json write_keys_to_files record_success "$task_func" show_progress; export MAX_RETRY_ATTEMPTS QUOTA_MAX_WAITS PURE_KEY_FILE COMMA_SEPARATED_KEY_FILE TEMP_DIR
+    export -f log retry_with_backoff parse_json write_keys_to_files record_success "$task_func" show_progress; export MAX_RETRY_ATTEMPTS QUOTA_MAX_WAITS PURE_KEY_FILE PROJECT_KEY_FILE COMMA_SEPARATED_KEY_FILE TEMP_DIR
     mkdir -p "$(dirname "$success_file")"; > "$success_file"
     for i in "${!items[@]}"; do
         if (( ${#pids[@]} >= MAX_PARALLEL_JOBS )); then
@@ -260,9 +263,22 @@ generate_report() {
     printf "  失败数量    : %d\n" "$failed"; printf "  成功率      : %.2f%%\n" "$success_rate"; printf "  总执行时间  : %d小时 %d分钟 %d秒\n" "$h" "$m" "$s"
     if (( success > 0 )) && [[ "$operation" == *"密钥"* ]]; then
         local key_count; key_count=$(wc -l < "$PURE_KEY_FILE" 2>/dev/null || echo 0)
-        echo; echo "  输出文件:"; echo "  - 纯密钥文件    : $PURE_KEY_FILE ($key_count 个密钥)"; echo "  - 逗号分隔文件  : $COMMA_SEPARATED_KEY_FILE"
+        echo; echo "  输出文件:"; echo "  - 项目|密钥文件  : $PROJECT_KEY_FILE"; echo "  - 纯密钥文件    : $PURE_KEY_FILE ($key_count 个密钥)"; echo "  - 逗号分隔文件  : $COMMA_SEPARATED_KEY_FILE"
     fi
     echo "================================================================"
+    if [[ "$operation" == *"密钥"* ]]; then show_key_list; fi
+}
+
+# 按设置显示密钥列表 (按项目排序)
+show_key_list() {
+    [[ -s "$PROJECT_KEY_FILE" ]] || return 0
+    echo; echo "------------------------ 密钥列表 ------------------------"
+    if [[ "$KEY_DISPLAY_MODE" == "key" ]]; then
+        sort -t"|" -k1,1 "$PROJECT_KEY_FILE" | cut -d"|" -f2-
+    else
+        sort -t"|" -k1,1 "$PROJECT_KEY_FILE"
+    fi
+    echo "----------------------------------------------------------"
 }
 
 # ===== 主要功能模块 =====
@@ -298,7 +314,7 @@ create_projects_phased() {
     check_quota || return 1
     log "INFO" "将创建 $TOTAL_PROJECTS 个新项目。用户名: $EMAIL_USERNAME, 项目前缀: $PROJECT_PREFIX"
     read -p "确认开始吗? [y/N]: " r; [[ "$r" =~ ^[Yy]$ ]] || { log "INFO" "操作已取消。"; return 1; }
-    > "$PURE_KEY_FILE"; > "$COMMA_SEPARATED_KEY_FILE"
+    > "$PURE_KEY_FILE"; > "$COMMA_SEPARATED_KEY_FILE"; > "$PROJECT_KEY_FILE"
     local projects_to_create=(); for i in $(seq 1 $TOTAL_PROJECTS); do local p_id="${PROJECT_PREFIX}-${EMAIL_USERNAME}-$(printf "%03d" $i)"; p_id=$(echo "$p_id"|tr -cd 'a-z0-9-'|cut -c 1-30|sed 's/-$//'); projects_to_create+=("$p_id"); done
     local CREATED_PROJECTS_FILE="${TEMP_DIR}/created.txt"; run_parallel task_create_project "阶段1: 创建项目" "$CREATED_PROJECTS_FILE" "${projects_to_create[@]}"
     local created_project_ids=(); mapfile -t created_project_ids < "$CREATED_PROJECTS_FILE"; if [ ${#created_project_ids[@]} -eq 0 ]; then log "ERROR" "项目创建阶段完全失败。"; return 1; fi
@@ -313,7 +329,7 @@ extract_keys_from_existing_projects() {
     SECONDS=0; log "INFO" "==================== 功能2: 从现有项目中提取密钥 ===================="
     log "INFO" "正在获取项目列表..."; local project_list; project_list=$(gcloud projects list --format='value(projectId)' --filter='projectId!~^sys-' --quiet)
     if [ -z "$project_list" ]; then log "INFO" "未找到任何用户项目。"; return 0; fi
-    local projects_array; readarray -t projects_array <<< "$project_list"; > "$PURE_KEY_FILE"; > "$COMMA_SEPARATED_KEY_FILE"
+    local projects_array; readarray -t projects_array <<< "$project_list"; > "$PURE_KEY_FILE"; > "$COMMA_SEPARATED_KEY_FILE"; > "$PROJECT_KEY_FILE"
     local projects_to_process=(); log "INFO" "正在检查 ${#projects_array[@]} 个项目的密钥状态..."
     start_heartbeat "检查密钥状态..." 10
     for project_id in "${projects_array[@]}"; do
@@ -361,11 +377,10 @@ read_existing_keys() {
     fi
     if [ ${#selected[@]} -eq 0 ]; then log "ERROR" "没有选中任何项目。"; return 1; fi
     log "INFO" "将读取 ${#selected[@]} 个项目的API密钥。"
-    > "$PURE_KEY_FILE"; > "$COMMA_SEPARATED_KEY_FILE"
+    > "$PURE_KEY_FILE"; > "$COMMA_SEPARATED_KEY_FILE"; > "$PROJECT_KEY_FILE"
     local READ_FILE="${TEMP_DIR}/read_keys.txt"; run_parallel task_read_keys "读取密钥" "$READ_FILE" "${selected[@]}"
     local success_count; success_count=$(wc -l < "$READ_FILE" | xargs)
     generate_report "$success_count" $((${#selected[@]} - success_count)) "${#selected[@]}" "读取现有密钥"
-    if [[ -s "$PURE_KEY_FILE" ]]; then echo; echo "------------------------ 密钥列表 ------------------------"; cat "$PURE_KEY_FILE"; fi
 }
 
 create_projects_only() {    SECONDS=0; log "INFO" "==================== 功能3: 仅创建项目 ===================="
@@ -403,15 +418,19 @@ configure_settings() {
     while true; do
         clear; echo "======================== 配置参数 ========================"
         echo " 1. 项目创建数量       : $TOTAL_PROJECTS"; echo " 2. 项目前缀           : $PROJECT_PREFIX"; echo " 3. 最大并发数         : $MAX_PARALLEL_JOBS"
-        echo " 4. 全局等待时间(秒)   : $GLOBAL_WAIT_SECONDS"; echo " 5. 最大重试次数       : $MAX_RETRY_ATTEMPTS"; echo; echo " 0. 返回主菜单"
+        echo " 4. 全局等待时间(秒)   : $GLOBAL_WAIT_SECONDS"; echo " 5. 最大重试次数       : $MAX_RETRY_ATTEMPTS"
+        echo " 6. 密钥显示方式       : $([[ "$KEY_DISPLAY_MODE" == "key" ]] && echo "仅密钥" || echo "项目|密钥")"; echo; echo " 0. 返回主菜单"
         echo "================================================================"
-        read -p "选择要修改的设置 [0-5]: " choice
+        read -p "选择要修改的设置 [0-6]: " choice
         case $choice in
             1) read -p "输入新的项目数量 (1-999): " val; if [[ "$val" =~ ^[1-9][0-9]*$ && "$val" -le 999 ]]; then TOTAL_PROJECTS=$val; log "INFO" "配置更新: 项目数量 -> $TOTAL_PROJECTS"; fi;;
             2) read -p "输入新的项目前缀: " val; if [[ "$val" =~ ^[a-z][a-z0-9-]{0,20}$ ]]; then PROJECT_PREFIX="$val"; log "INFO" "配置更新: 项目前缀 -> $PROJECT_PREFIX"; fi;;
             3) read -p "输入最大并发数 (5-50): " val; if [[ "$val" =~ ^[0-9]+$ && "$val" -ge 5 && "$val" -le 50 ]]; then MAX_PARALLEL_JOBS=$val; log "INFO" "配置更新: 最大并发数 -> $MAX_PARALLEL_JOBS"; fi;;
             4) read -p "输入全局等待时间 (秒, >=30): " val; if [[ "$val" =~ ^[0-9]+$ && "$val" -ge 30 ]]; then GLOBAL_WAIT_SECONDS=$val; log "INFO" "配置更新: 全局等待 -> $GLOBAL_WAIT_SECONDS"; fi;;
             5) read -p "输入最大重试次数 (1-5): " val; if [[ "$val" =~ ^[1-5]$ ]]; then MAX_RETRY_ATTEMPTS=$val; log "INFO" "配置更新: 重试次数 -> $MAX_RETRY_ATTEMPTS"; fi;;
+            6) echo "  1) 项目|密钥   2) 仅密钥"; read -p "选择显示方式 [1-2]: " val
+               case $val in 1) KEY_DISPLAY_MODE="project";; 2) KEY_DISPLAY_MODE="key";; esac
+               log "INFO" "配置更新: 密钥显示方式 -> $KEY_DISPLAY_MODE";;
             0) return;;
             *) echo "无效选项。" && sleep 1;;
         esac
