@@ -197,8 +197,19 @@ task_create_key() {
     fi
 }
 
-task_delete_project() {
-    local project_id="$1"; local success_file="$2"
+task_read_keys() {
+    local project_id="$1"; local success_file="$2"; local key_names
+    readarray -t key_names < <(retry_with_backoff "$MAX_RETRY_ATTEMPTS" "gcloud services api-keys list --project=\"$project_id\" --format=\"value(name)\" --quiet" | grep -v '^$')
+    if [ ${#key_names[@]} -eq 0 ]; then log "WARN" "项目 $project_id 中没有API密钥。"; return 1; fi
+    local got=0 key_name key_string
+    for key_name in "${key_names[@]}"; do
+        key_string=$(retry_with_backoff "$MAX_RETRY_ATTEMPTS" "gcloud services api-keys get-key-string \"$key_name\" --format=\"value(keyString)\" --quiet" | tr -d '[:space:]')
+        if [[ -n "$key_string" ]]; then write_keys_to_files "$key_string"; ((got++)); else log "ERROR" "读取密钥失败: $key_name"; fi
+    done
+    if (( got > 0 )); then record_success "$project_id" "$success_file"; return 0; else return 1; fi
+}
+
+task_delete_project() {    local project_id="$1"; local success_file="$2"
     if retry_with_backoff 2 "gcloud projects delete \"$project_id\" --quiet"; then
         record_success "$project_id" "$success_file"; return 0
     else return 1; fi
@@ -319,8 +330,45 @@ extract_keys_from_existing_projects() {
     local successful_keys; successful_keys=$(wc -l < "$KEYS_CREATED_FILE" 2>/dev/null || echo 0); generate_report "$successful_keys" $((${#projects_to_process[@]} - successful_keys)) "${#projects_to_process[@]}" "提取现有密钥"
 }
 
-create_projects_only() {
-    SECONDS=0; log "INFO" "==================== 功能3: 仅创建项目 ===================="
+read_existing_keys() {
+    SECONDS=0; log "INFO" "==================== 功能7: 读取现有项目的API密钥 ===================="
+    log "INFO" "正在获取项目列表..."; local project_list; project_list=$(gcloud projects list --format='value(projectId)' --filter='projectId!~^sys-' --sort-by=projectId --quiet)
+    if [ -z "$project_list" ]; then log "INFO" "未找到任何用户项目。"; return 0; fi
+    local projects_array; readarray -t projects_array <<< "$project_list"
+    echo "------------------------------------------------------------------------"
+    local i; for i in "${!projects_array[@]}"; do printf "  %3d. %s\n" "$((i+1))" "${projects_array[i]}"; done
+    echo "------------------------------------------------------------------------"
+    echo "  直接回车 = 读取全部项目; 也可输入编号 (如 1 3 5 或 2-8) 或项目ID"
+    local sel; flush_stdin; read -p "请选择: " sel
+    local selected=()
+    if [[ -z "${sel// /}" ]]; then
+        selected=("${projects_array[@]}")
+    else
+        local tok a b n
+        for tok in ${sel//,/ }; do
+            if [[ "$tok" =~ ^([0-9]+)-([0-9]+)$ ]]; then
+                a=${BASH_REMATCH[1]}; b=${BASH_REMATCH[2]}
+                for ((n=a; n<=b; n++)); do (( n>=1 && n<=${#projects_array[@]} )) && selected+=("${projects_array[n-1]}"); done
+            elif [[ "$tok" =~ ^[0-9]+$ ]] && (( tok>=1 && tok<=${#projects_array[@]} )); then
+                selected+=("${projects_array[tok-1]}")
+            elif printf '%s\n' "${projects_array[@]}" | grep -qxF "$tok"; then
+                selected+=("$tok")
+            else
+                log "WARN" "忽略无效输入: $tok"
+            fi
+        done
+        readarray -t selected < <(printf '%s\n' "${selected[@]}" | awk 'NF && !seen[$0]++')
+    fi
+    if [ ${#selected[@]} -eq 0 ]; then log "ERROR" "没有选中任何项目。"; return 1; fi
+    log "INFO" "将读取 ${#selected[@]} 个项目的API密钥。"
+    > "$PURE_KEY_FILE"; > "$COMMA_SEPARATED_KEY_FILE"
+    local READ_FILE="${TEMP_DIR}/read_keys.txt"; run_parallel task_read_keys "读取密钥" "$READ_FILE" "${selected[@]}"
+    local success_count; success_count=$(wc -l < "$READ_FILE" | xargs)
+    generate_report "$success_count" $((${#selected[@]} - success_count)) "${#selected[@]}" "读取现有密钥"
+    if [[ -s "$PURE_KEY_FILE" ]]; then echo; echo "------------------------ 密钥列表 ------------------------"; cat "$PURE_KEY_FILE"; fi
+}
+
+create_projects_only() {    SECONDS=0; log "INFO" "==================== 功能3: 仅创建项目 ===================="
     read -p "请输入要创建的项目数量 (默认: $TOTAL_PROJECTS): " custom_count; custom_count=${custom_count:-$TOTAL_PROJECTS}
     if ! [[ "$custom_count" =~ ^[1-9][0-9]*$ ]]; then log "ERROR" "无效输入"; return 1; fi
     local projects_to_create=(); for i in $(seq 1 $custom_count); do local p_id="${PROJECT_PREFIX}-${EMAIL_USERNAME}-only-$(printf "%03d" $i)"; p_id=$(echo "$p_id"|tr -cd 'a-z0-9-'|cut -c 1-30|sed 's/-$//'); projects_to_create+=("$p_id"); done
@@ -378,18 +426,18 @@ show_menu() {
     echo "========================================================================"; echo "  当前账号: ${current_account:-未登录} | 并发数: $MAX_PARALLEL_JOBS | 等待时间: ${GLOBAL_WAIT_SECONDS}s"
     echo "========================================================================"
     echo "  1. 一键创建项目并获取密钥 (数量可自定义, 默认 ${TOTAL_PROJECTS})"; echo "  2. 从现有项目中提取密钥 (智能检查)"; echo "  3. 仅创建项目 (不启用API，不取密钥)"
-    echo "  4. 删除所有现有项目 (危险操作)"; echo "  5. 清理所有项目中的API密钥 (危险操作)"; echo "  6. 修改配置参数"; echo; echo "  0. 退出程序"
+    echo "  4. 删除所有现有项目 (危险操作)"; echo "  5. 清理所有项目中的API密钥 (危险操作)"; echo "  6. 修改配置参数"; echo "  7. 读取现有项目的API密钥 (可按项目选择)"; echo; echo "  0. 退出程序"
     echo "========================================================================"
-    flush_stdin; read -p "请选择功能 [0-6]: " choice
+    flush_stdin; read -p "请选择功能 [0-7]: " choice
     case $choice in
         1) create_projects_phased ;; 2) extract_keys_from_existing_projects ;; 3) create_projects_only ;; 4) delete_all_existing_projects ;;
-        5) cleanup_project_api_keys ;; 6) configure_settings ;; 0) log "INFO" "程序已退出。"; exit 0 ;; *) echo "无效选项。" && sleep 1 ;;
+        5) cleanup_project_api_keys ;; 6) configure_settings ;; 7) read_existing_keys ;; 0) log "INFO" "程序已退出。"; exit 0 ;; *) echo "无效选项。" && sleep 1 ;;
     esac
     flush_stdin; read -p "按回车键返回主菜单..."
 }
 
 # 清空输入缓冲, 防止运行期间误按的回车跳过暂停/菜单
-flush_stdin() { local _d; while read -r -t 0.05 -n 10000 _d 2>/dev/null; do :; done; }
+flush_stdin() { [[ -t 0 ]] || return 0; local _d; while read -r -t 0.05 -n 10000 _d 2>/dev/null; do :; done; }
 
 cleanup_resources() {
     # 只允许主进程执行清理, 防止子进程/后台任务误删临时目录
