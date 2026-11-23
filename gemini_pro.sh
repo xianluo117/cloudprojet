@@ -137,6 +137,10 @@ retry_with_backoff() {
         log "WARN" "命令失败 (尝试 $attempt/$max_attempts): $(echo "$cmd_str" | cut -d' ' -f1-4)..."
         local short_err; short_err=$(echo "$error_msg" | grep -oE '"message": "[^"]*"|ERROR: \([^)]*\)[^<{]*' | head -n 2 | tr '\n' ' ')
         log "WARN" "--> 错误详情: ${short_err:-$(echo "$error_msg" | head -c 300)}"
+        if [[ "$error_msg" == *"allotted project quota"* ]]; then
+            touch "${TEMP_DIR}/project_quota_exhausted" 2>/dev/null
+            log "ERROR" "账号的项目数量配额已用完 (不是每分钟限流, 重试无效)，停止创建剩余项目。"; return 1
+        fi
         if [[ "$error_msg" == *"Permission denied"* || "$error_msg" == *"INVALID_ARGUMENT"* || "$error_msg" == *"already exists"* || "$error_msg" == *"Invalid value for"* ]]; then
             log "ERROR" "检测到不可重试错误，停止。"; return $exit_code;
         fi
@@ -170,6 +174,7 @@ show_progress() {
 
 task_create_project() {
     local project_id="$1"; local success_file="$2"
+    [[ -f "${TEMP_DIR}/project_quota_exhausted" ]] && return 1
     if retry_with_backoff "$MAX_RETRY_ATTEMPTS" "gcloud projects create \"$project_id\" --name=\"$project_id\" --no-set-as-default --quiet"; then
         record_success "$project_id" "$success_file"; return 0
     else return 1; fi
@@ -239,7 +244,7 @@ run_parallel() {
     log "INFO" "开始并行执行 '$description' (最大并发: $MAX_PARALLEL_JOBS)..."
     local pids=(); local completed_count=0
     export -f log retry_with_backoff parse_json write_keys_to_files record_success "$task_func" show_progress; export MAX_RETRY_ATTEMPTS QUOTA_MAX_WAITS PURE_KEY_FILE PROJECT_KEY_FILE COMMA_SEPARATED_KEY_FILE TEMP_DIR
-    mkdir -p "$(dirname "$success_file")"; > "$success_file"
+    mkdir -p "$(dirname "$success_file")"; > "$success_file"; rm -f "${TEMP_DIR}/project_quota_exhausted"
     for i in "${!items[@]}"; do
         if (( ${#pids[@]} >= MAX_PARALLEL_JOBS )); then
             wait -n "${pids[@]}"; for j in "${!pids[@]}"; do if ! kill -0 "${pids[j]}" 2>/dev/null; then unset 'pids[j]'; ((completed_count++)); fi; done
@@ -252,6 +257,9 @@ run_parallel() {
     wait; show_progress "$total_items" "$total_items" "$description 完成"
     local success_count; success_count=$(wc -l < "$success_file" | xargs); local fail_count=$((total_items - success_count))
     echo; log "INFO" "阶段 '$description' 完成。总数: $total_items, 成功: $success_count, 失败: $fail_count"
+    if [[ -f "${TEMP_DIR}/project_quota_exhausted" ]]; then
+        log "WARN" "项目配额已满: 本次只创建了 $success_count 个项目。已删除的项目在 30 天内仍占用配额，可在 GCP 控制台申请提高项目配额。"
+    fi
 }
 
 generate_report() {
