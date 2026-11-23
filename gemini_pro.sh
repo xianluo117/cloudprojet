@@ -24,6 +24,8 @@ TOTAL_PROJECTS=75
 MAX_PARALLEL_JOBS=5
 GLOBAL_WAIT_SECONDS=75
 MAX_RETRY_ATTEMPTS=3
+QUOTA_MAX_WAITS=6          # 遇到 429 配额限制时最多额外等待的次数 (每次约60秒, 不计入普通重试次数)
+LAUNCH_INTERVAL=1          # 并行任务之间的启动间隔(秒), 降低每分钟请求峰值
 SECONDS=0
 
 # 文件和目录配置
@@ -121,7 +123,7 @@ record_success() {
 
 # 改进的重试函数
 retry_with_backoff() {
-    local max_attempts=$1; shift; local cmd_str="$1"; local attempt=1; local base_timeout=5
+    local max_attempts=$1; shift; local cmd_str="$1"; local attempt=1; local base_timeout=5; local quota_waits=0
     while (( attempt <= max_attempts )); do
         local output; local error_msg;
         local tmp_out; tmp_out=$(mktemp "${TEMP_DIR}/out.XXXXXX" 2>/dev/null || mktemp)
@@ -130,12 +132,19 @@ retry_with_backoff() {
         output=$(cat "$tmp_out" 2>/dev/null); rm -f "$tmp_out"
         if (( exit_code == 0 )); then echo "$output"; return 0; fi
         log "WARN" "命令失败 (尝试 $attempt/$max_attempts): $(echo "$cmd_str" | cut -d' ' -f1-4)..."
-        log "WARN" "--> 错误详情: $error_msg"
+        local short_err; short_err=$(echo "$error_msg" | grep -oE '"message": "[^"]*"|ERROR: \([^)]*\)[^<{]*' | head -n 2 | tr '\n' ' ')
+        log "WARN" "--> 错误详情: ${short_err:-$(echo "$error_msg" | head -c 300)}"
         if [[ "$error_msg" == *"Permission denied"* || "$error_msg" == *"INVALID_ARGUMENT"* || "$error_msg" == *"already exists"* || "$error_msg" == *"Invalid value for"* ]]; then
             log "ERROR" "检测到不可重试错误，停止。"; return $exit_code;
         fi
-        if [[ "$error_msg" == *"Quota exceeded"* || "$error_msg" == *"RESOURCE_EXHAUSTED"* ]]; then
-            local sleep_time=$((base_timeout * attempt * 2)); log "WARN" "检测到配额限制，等待 ${sleep_time}s"; sleep "$sleep_time"
+        if [[ "$error_msg" == *"Quota exceeded"* || "$error_msg" == *"RESOURCE_EXHAUSTED"* || "$error_msg" == *"RATE_LIMIT_EXCEEDED"* || "$error_msg" == *"status': 429"* ]]; then
+            if (( quota_waits < ${QUOTA_MAX_WAITS:-6} )); then
+                ((quota_waits++))
+                local sleep_time=$((60 + RANDOM % 20))
+                log "WARN" "触发每分钟请求配额限制 (429)，等待 ${sleep_time}s 后重试 (配额等待 $quota_waits/${QUOTA_MAX_WAITS:-6})"
+                sleep "$sleep_time"; continue
+            fi
+            log "ERROR" "配额等待次数已用完，放弃。"; return 1
         elif (( attempt < max_attempts )); then
             local sleep_time=$((base_timeout * attempt)); log "INFO" "等待 ${sleep_time}s 后重试..."; sleep "$sleep_time"
         fi
@@ -215,7 +224,7 @@ run_parallel() {
     if (( total_items == 0 )); then log "INFO" "在 '$description' 阶段无项目处理。"; return; fi
     log "INFO" "开始并行执行 '$description' (最大并发: $MAX_PARALLEL_JOBS)..."
     local pids=(); local completed_count=0
-    export -f log retry_with_backoff parse_json write_keys_to_files record_success "$task_func" show_progress; export MAX_RETRY_ATTEMPTS PURE_KEY_FILE COMMA_SEPARATED_KEY_FILE TEMP_DIR
+    export -f log retry_with_backoff parse_json write_keys_to_files record_success "$task_func" show_progress; export MAX_RETRY_ATTEMPTS QUOTA_MAX_WAITS PURE_KEY_FILE COMMA_SEPARATED_KEY_FILE TEMP_DIR
     mkdir -p "$(dirname "$success_file")"; > "$success_file"
     for i in "${!items[@]}"; do
         if (( ${#pids[@]} >= MAX_PARALLEL_JOBS )); then
@@ -223,6 +232,7 @@ run_parallel() {
             show_progress "$completed_count" "$total_items" "$description"
         fi
         ( "$task_func" "${items[i]}" "$success_file" ) & pids+=($!)
+        (( i < total_items - 1 )) && sleep "${LAUNCH_INTERVAL:-1}"
     done
     for pid in "${pids[@]}"; do wait "$pid"; ((completed_count++)); show_progress "$completed_count" "$total_items" "$description"; done
     wait; show_progress "$total_items" "$total_items" "$description 完成"
@@ -370,13 +380,16 @@ show_menu() {
     echo "  1. 一键创建项目并获取密钥 (数量可自定义, 默认 ${TOTAL_PROJECTS})"; echo "  2. 从现有项目中提取密钥 (智能检查)"; echo "  3. 仅创建项目 (不启用API，不取密钥)"
     echo "  4. 删除所有现有项目 (危险操作)"; echo "  5. 清理所有项目中的API密钥 (危险操作)"; echo "  6. 修改配置参数"; echo; echo "  0. 退出程序"
     echo "========================================================================"
-    read -p "请选择功能 [0-6]: " choice
+    flush_stdin; read -p "请选择功能 [0-6]: " choice
     case $choice in
         1) create_projects_phased ;; 2) extract_keys_from_existing_projects ;; 3) create_projects_only ;; 4) delete_all_existing_projects ;;
         5) cleanup_project_api_keys ;; 6) configure_settings ;; 0) log "INFO" "程序已退出。"; exit 0 ;; *) echo "无效选项。" && sleep 1 ;;
     esac
-    read -p "按回车键返回主菜单..."
+    flush_stdin; read -p "按回车键返回主菜单..."
 }
+
+# 清空输入缓冲, 防止运行期间误按的回车跳过暂停/菜单
+flush_stdin() { local _d; while read -r -t 0.05 -n 10000 _d 2>/dev/null; do :; done; }
 
 cleanup_resources() {
     # 只允许主进程执行清理, 防止子进程/后台任务误删临时目录
